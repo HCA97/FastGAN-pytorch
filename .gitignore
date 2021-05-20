@@ -1,0 +1,4 @@
+train_results/*
+**/__pycache__/
+.vscode
+.env
