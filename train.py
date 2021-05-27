@@ -264,7 +264,7 @@ def train(args):
                         rec_img_part]).add(1).mul(0.5), saved_image_folder+'/rec_%d.jpg' % iteration)
                 load_params(netG, backup_para)
 
-            if iteration % (save_interval*10) == 0 or iteration == total_iterations:
+            if iteration % (save_interval*50) == 0 or iteration == total_iterations:
                 backup_para = copy_G_params(netG)
                 load_params(netG, avg_param_G)
                 torch.save({'g': netG.state_dict(), 'd': netD.state_dict()},
