@@ -48,9 +48,14 @@ def load_params(model, new_param):
 
 
 def get_dir(args):
-    # task_name = "train_results/" + args.name
-    task_name = os.path.join(
-        "/scratch/s7hialtu/fast_gan/train_results", args.name)
+    cube_path = "/scratch/s7hialtu/fast_gan/train_results"
+    task_name = "train_results/" + args.name
+    if os.path.isdir(cube_path):
+        task_name = os.path.join(cube_path, args.name)
+
+    print("---------------------------")
+    print(f"TASK NAME => {task_name}")
+    print("---------------------------")
 
     saved_model_folder = os.path.join(task_name, 'models')
     saved_image_folder = os.path.join(task_name, 'images')
