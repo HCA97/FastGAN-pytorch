@@ -6,9 +6,12 @@ import torch.nn.functional as F
 from torch.utils.data.dataloader import DataLoader
 from torchvision import transforms
 from torchvision import utils as vutils
+from torch.utils.tensorboard import SummaryWriter
 
+import os
 import argparse
 from tqdm import tqdm
+import numpy as np
 
 from models import weights_init, Discriminator, Generator
 from operation import copy_G_params, load_params, get_dir
@@ -33,22 +36,33 @@ def crop_image_by_part(image, part):
         return image[:, :, hw:, hw:]
 
 
-def train_d(net, data, label="real"):
+def train_d(net, data, label="real", reconstruction=True):
     """Train function of discriminator"""
     if label == "real":
         pred, [rec_all, rec_small, rec_part], part = net(data, label)
-        err = F.relu(torch.rand_like(pred) * 0.2 + 0.8 - pred).mean() + \
-            percept(rec_all, F.interpolate(data, rec_all.shape[2])).sum() +\
-            percept(rec_small, F.interpolate(data, rec_small.shape[2])).sum() +\
-            percept(rec_part, F.interpolate(
-                crop_image_by_part(data, part), rec_part.shape[2])).sum()
+
+        # reconstruction loss
+        r1 = percept(rec_all, F.interpolate(
+            data, rec_all.shape[2])).sum() if reconstruction else 0
+        r2 = percept(rec_small, F.interpolate(
+            data, rec_small.shape[2])).sum() if reconstruction else 0
+        r3 = percept(rec_part, F.interpolate(
+            crop_image_by_part(data, part), rec_part.shape[2])).sum() if reconstruction else 0
+
+        # discriminator real image loss
+        dl = F.relu(torch.rand_like(pred) * 0.2 + 0.8 - pred).mean()
+
+        # total err
+        err = dl + r1 + r2 + r3
         err.backward()
-        return pred.mean().item(), rec_all, rec_small, rec_part
+        return [dl, r1, r2, r3], rec_all, rec_small, rec_part
+        # return pred.mean().item(), rec_all, rec_small, rec_part
     else:
         pred = net(data, label)
         err = F.relu(torch.rand_like(pred) * 0.2 + 0.8 + pred).mean()
         err.backward()
-        return pred.mean().item()
+        return err.item()
+        # return pred.mean().item()
 
 
 def train(args):
@@ -69,6 +83,13 @@ def train(args):
     current_iteration = 0
     save_interval = 100
     saved_model_folder, saved_image_folder = get_dir(args)
+    update_tensorboard = args.update_tensorboard
+    reconstruction = args.reconstruction
+
+    # create writer
+    logs_folder = os.path.join(
+        os.path.split(saved_image_folder)[0], "logs")
+    writer = SummaryWriter(logs_folder)
 
     device = torch.device("cpu")
     if use_cuda:
@@ -92,8 +113,8 @@ def train(args):
                                  sampler=InfiniteSamplerWrapper(dataset), num_workers=dataloader_workers, pin_memory=True))
     '''
     loader = MultiEpochsDataLoader(dataset, batch_size=batch_size, 
-                               shuffle=True, num_workers=dataloader_workers, 
-                               pin_memory=True)
+                            shuffle=True, num_workers=dataloader_workers, 
+                            pin_memory=True)
     dataloader = CudaDataLoader(loader, 'cuda')
     '''
 
@@ -115,8 +136,10 @@ def train(args):
         netG = nn.DataParallel(netG.cuda())
         netD = nn.DataParallel(netD.cuda())
 
-    optimizerG = optim.Adam(netG.parameters(), lr=nlr, betas=(nbeta1, 0.999))
-    optimizerD = optim.Adam(netD.parameters(), lr=nlr, betas=(nbeta1, 0.999))
+    optimizerG = optim.Adam(
+        netG.parameters(), lr=nlr, betas=(nbeta1, 0.999))
+    optimizerD = optim.Adam(
+        netD.parameters(), lr=nlr, betas=(nbeta1, 0.999))
 
     if checkpoint != 'None':
         ckpt = torch.load(checkpoint)
@@ -127,65 +150,133 @@ def train(args):
         optimizerD.load_state_dict(ckpt['opt_d'])
         current_iteration = int(checkpoint.split('_')[-1].split('.')[0])
         del ckpt
+    try:
+        for iteration in tqdm(range(current_iteration, total_iterations+1)):
+            real_image = next(dataloader)
+            real_image = real_image.cuda(non_blocking=True)
+            current_batch_size = real_image.size(0)
+            noise = torch.Tensor(current_batch_size,
+                                 nz).normal_(0, 1).to(device)
 
-    for iteration in tqdm(range(current_iteration, total_iterations+1)):
-        real_image = next(dataloader)
-        real_image = real_image.cuda(non_blocking=True)
-        current_batch_size = real_image.size(0)
-        noise = torch.Tensor(current_batch_size, nz).normal_(0, 1).to(device)
+            fake_images = netG(noise)
 
-        fake_images = netG(noise)
+            real_image = DiffAugment(real_image, policy=policy)
+            fake_images = [DiffAugment(fake, policy=policy)
+                           for fake in fake_images]
 
-        real_image = DiffAugment(real_image, policy=policy)
-        fake_images = [DiffAugment(fake, policy=policy)
-                       for fake in fake_images]
+            # 2. train Discriminator
+            netD.zero_grad()
 
-        # 2. train Discriminator
-        netD.zero_grad()
+            losses, rec_img_all, rec_img_small, rec_img_part = train_d(
+                netD, real_image, label="real", reconstruction=reconstruction)
+            dl, r1, r2, r3 = losses
+            err_dr = dl + r1 + r2 + r3
+            err_dr_fake = train_d(netD, [fi.detach()
+                                         for fi in fake_images], label="fake")
 
-        err_dr, rec_img_all, rec_img_small, rec_img_part = train_d(
-            netD, real_image, label="real")
-        train_d(netD, [fi.detach() for fi in fake_images], label="fake")
-        optimizerD.step()
+            # gradient tensorboard
+            if iteration % update_tensorboard == 0:
+                avg_grad = []
+                for name, params in netD.named_parameters():
+                    if params.grad is not None:
+                        grad = params.grad.detach().cpu().numpy()
+                        avg_grad.append(np.linalg.norm(
+                            grad) / np.prod(grad.shape))
+                        writer.add_histogram(
+                            "DiscriminatorGradient/" + name, grad, iteration)
+                avg_grad = np.array(avg_grad)
+                writer.add_histogram(
+                    "Gradient/DiscriminatorAvgPerLayer", avg_grad, iteration)
+                writer.add_scalar("Gradient/Discriminator",
+                                  np.mean(avg_grad), iteration)
+            optimizerD.step()
 
-        # 3. train Generator
-        netG.zero_grad()
-        pred_g = netD(fake_images, "fake")
-        err_g = -pred_g.mean()
+            # 3. train Generator
+            netG.zero_grad()
+            pred_g = netD(fake_images, "fake")
+            err_g = -pred_g.mean()
 
-        err_g.backward()
-        optimizerG.step()
+            err_g.backward()
 
-        for p, avg_p in zip(netG.parameters(), avg_param_G):
-            avg_p.mul_(0.999).add_(0.001 * p.data)
+            # gradient tensorboard
+            if iteration % update_tensorboard == 0:
+                avg_grad = []
+                for name, params in netG.named_parameters():
+                    if params.grad is not None:
+                        grad = params.grad.detach().cpu().numpy()
+                        avg_grad.append(np.linalg.norm(
+                            grad) / np.prod(grad.shape))
+                        writer.add_histogram(
+                            "GeneratorGradient/" + name, grad, iteration)
+                avg_grad = np.array(avg_grad)
+                writer.add_histogram(
+                    "Gradient/GeneratorAvgPerLayer", avg_grad, iteration)
+                writer.add_scalar("Gradient/Generator",
+                                  np.mean(avg_grad), iteration)
+            optimizerG.step()
 
-        if iteration % 100 == 0:
-            print("GAN: loss d: %.5f    loss g: %.5f" %
-                  (err_dr, -err_g.item()))
+            # scalar tensorboard
+            writer.add_scalar("Loss/Discriminator",
+                              err_dr + err_dr_fake, iteration)
+            writer.add_scalar("Loss/Generator", -err_g.item(), iteration)
 
-        if iteration % (save_interval*10) == 0:
-            backup_para = copy_G_params(netG)
-            load_params(netG, avg_param_G)
-            with torch.no_grad():
-                vutils.save_image(netG(fixed_noise)[0].add(1).mul(
-                    0.5), saved_image_folder+'/%d.jpg' % iteration, nrow=4)
-                vutils.save_image(torch.cat([
-                    F.interpolate(real_image, 128),
-                    rec_img_all, rec_img_small,
-                    rec_img_part]).add(1).mul(0.5), saved_image_folder+'/rec_%d.jpg' % iteration)
-            load_params(netG, backup_para)
+            writer.add_scalar("Discriminator/DiscriminatorLossRealImage",
+                              dl, iteration)
+            writer.add_scalar(
+                "Discriminator/DiscriminatorLossFakeImage", err_dr_fake, iteration)
+            writer.add_scalar("Discriminator/AllImageReconstruction",
+                              r1, iteration)
+            writer.add_scalar("Discriminator/SmallImageReconstruction",
+                              r2, iteration)
+            writer.add_scalar("Discriminator/CroppedImageReconstruction",
+                              r3, iteration)
 
-        if iteration % (save_interval*50) == 0 or iteration == total_iterations:
-            backup_para = copy_G_params(netG)
-            load_params(netG, avg_param_G)
-            torch.save({'g': netG.state_dict(), 'd': netD.state_dict()},
-                       saved_model_folder+'/%d.pth' % iteration)
-            load_params(netG, backup_para)
-            torch.save({'g': netG.state_dict(),
-                        'd': netD.state_dict(),
-                        'g_ema': avg_param_G,
-                        'opt_g': optimizerG.state_dict(),
-                        'opt_d': optimizerD.state_dict()}, saved_model_folder+'/all_%d.pth' % iteration)
+            # model weight tensorboard
+            if iteration % update_tensorboard == 0:
+                with torch.no_grad():
+                    for (name, params), avg_params in zip(netG.named_parameters(), avg_param_G):
+                        if params.grad is not None:
+                            writer.add_histogram(
+                                "GeneratorWeights/" + name, params.detach().cpu().numpy(), iteration)
+                            writer.add_histogram(
+                                "AverageGeneratorWeights/" + name, avg_params.detach().cpu().numpy(), iteration)
+                    for name, params in netD.named_parameters():
+                        if params.grad is not None:
+                            writer.add_histogram(
+                                "DiscriminatorWeights/" + name, params.detach().cpu().numpy(), iteration)
+
+            for p, avg_p in zip(netG.parameters(), avg_param_G):
+                avg_p.mul_(0.999).add_(0.001 * p.data)
+
+            if iteration % 100 == 0:
+                print("GAN: loss d: %.5f    loss g: %.5f" %
+                      (err_dr + err_dr_fake, -err_g.item()))
+
+            if iteration % (save_interval*10) == 0:
+                backup_para = copy_G_params(netG)
+                load_params(netG, avg_param_G)
+                with torch.no_grad():
+                    vutils.save_image(netG(fixed_noise)[0].add(1).mul(
+                        0.5), saved_image_folder+'/%d.jpg' % iteration, nrow=4)
+                    vutils.save_image(torch.cat([
+                        F.interpolate(real_image, 128),
+                        rec_img_all, rec_img_small,
+                        rec_img_part]).add(1).mul(0.5), saved_image_folder+'/rec_%d.jpg' % iteration)
+                load_params(netG, backup_para)
+
+            if iteration % (save_interval*50) == 0 or iteration == total_iterations:
+                backup_para = copy_G_params(netG)
+                load_params(netG, avg_param_G)
+                torch.save({'g': netG.state_dict(), 'd': netD.state_dict()},
+                           saved_model_folder+'/%d.pth' % iteration)
+                load_params(netG, backup_para)
+                torch.save({'g': netG.state_dict(),
+                            'd': netD.state_dict(),
+                            'g_ema': avg_param_G,
+                            'opt_g': optimizerG.state_dict(),
+                            'opt_d': optimizerD.state_dict()}, saved_model_folder+'/all_%d.pth' % iteration)
+    finally:
+        writer.close()
 
 
 if __name__ == "__main__":
@@ -207,7 +298,11 @@ if __name__ == "__main__":
                         default=1024, help='image resolution')
     parser.add_argument('--ckpt', type=str, default='None',
                         help='checkpoint weight path if have one')
-
+    parser.add_argument("--update_tensorboard", type=int, default=1,
+                        help="tensorboard update frequency for histogram computation")
+    parser.add_argument("--disable_reconstruction", dest="reconstruction",
+                        help="disables reconstruction loss", action="store_false")
+    parser.set_defaults(reconstruction=True)
     args = parser.parse_args()
     print(args)
 

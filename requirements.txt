@@ -10,3 +10,4 @@ lmdb==1.2.1
 numpy==1.19.4
 scikit-image==0.17.2
 ipython==7.15.0
+tensorboard
